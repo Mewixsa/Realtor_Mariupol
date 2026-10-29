@@ -27,7 +27,48 @@ const defaultApiUrl = 'https://realtor-bot-j6kl.onrender.com';
 const apiUrl = (renderApiUrl || defaultApiUrl).replace(/\/$/, '');
 const bookingForm = document.querySelector('#booking-form');
 const formStatus = document.querySelector('#form-status');
+const successModal = document.querySelector('#success-modal');
 const phoneInput = document.querySelector('#phone');
+let selectedProperty = '';
+
+function closeSuccessModal() {
+    if (!successModal) return;
+    successModal.hidden = true;
+    document.body.classList.remove('modal-open');
+}
+
+successModal?.querySelectorAll('[data-close-success]').forEach((button) => {
+    button.addEventListener('click', closeSuccessModal);
+});
+
+document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && successModal && !successModal.hidden) {
+        closeSuccessModal();
+    }
+});
+
+function selectPropertyAndOpenForm(card) {
+    if (!card) return;
+    selectedProperty = card.dataset.propertyTitle || 'Выбранная квартира';
+    const goal = bookingForm?.elements.goal;
+    if (goal) {
+        const specificPropertyOption = [...goal.options].find((option) => option.value === 'Узнать о конкретной квартире');
+        if (specificPropertyOption) goal.value = specificPropertyOption.value;
+    }
+    document.querySelector('#booking')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+propertyGrid?.addEventListener('click', (event) => {
+    selectPropertyAndOpenForm(event.target.closest('.property-card'));
+});
+
+propertyGrid?.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    const card = event.target.closest('.property-card');
+    if (!card) return;
+    event.preventDefault();
+    selectPropertyAndOpenForm(card);
+});
 
 phoneInput?.addEventListener('input', (event) => {
     let digits = event.target.value.replace(/\D/g, '');
@@ -58,7 +99,9 @@ bookingForm?.addEventListener('submit', async (event) => {
         name: bookingForm.elements.name.value.trim(),
         phone: bookingForm.elements.phone.value.trim(),
         telegram: bookingForm.elements.telegram.value.trim() || 'Не указан',
-        goal: bookingForm.elements.goal.value,
+        goal: selectedProperty
+            ? `${bookingForm.elements.goal.value} — ${selectedProperty}`
+            : bookingForm.elements.goal.value,
         contact: bookingForm.querySelector('input[name="contact"]:checked')?.value || 'Не выбран',
     };
 
@@ -79,8 +122,14 @@ bookingForm?.addEventListener('submit', async (event) => {
         }
 
         bookingForm.reset();
+        selectedProperty = '';
         formStatus.textContent = 'Заявка отправлена! Я свяжусь с вами удобным способом.';
         formStatus.classList.add('is-success');
+        if (successModal) {
+            successModal.hidden = false;
+            document.body.classList.add('modal-open');
+            successModal.querySelector('.success-modal__close')?.focus();
+        }
     } catch (error) {
         console.error('Не удалось отправить заявку:', error);
         formStatus.textContent = 'Не удалось отправить заявку. Попробуйте ещё раз чуть позже.';
@@ -112,6 +161,10 @@ function showCatalogState(title, message, retry = false) {
 function createPropertyCard(property) {
     const card = document.createElement('article');
     card.className = 'property-card';
+    card.dataset.propertyTitle = [property.title, property.address].filter(Boolean).join(' — ');
+    card.tabIndex = 0;
+    card.setAttribute('role', 'link');
+    card.setAttribute('aria-label', `Оставить заявку на ${card.dataset.propertyTitle || 'квартиру'}`);
 
     const photoUrl = typeof property.photo_url === 'string' ? property.photo_url.trim() : '';
     if (photoUrl) {

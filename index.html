@@ -89,6 +89,18 @@
             </form>
         </section>
 
+        <div class="success-modal" id="success-modal" role="dialog" aria-modal="true" aria-labelledby="success-title" hidden>
+            <div class="success-modal__backdrop" data-close-success></div>
+            <div class="success-modal__panel">
+                <button class="success-modal__close" type="button" aria-label="Закрыть окно" data-close-success>×</button>
+                <span class="success-modal__mark" aria-hidden="true">✓</span>
+                <span class="eyebrow">ЗАЯВКА ОТПРАВЛЕНА</span>
+                <h2 id="success-title">Спасибо за обращение!</h2>
+                <p>Я получила вашу заявку и свяжусь с вами удобным способом.</p>
+                <button class="button button-dark" type="button" data-close-success>Хорошо</button>
+            </div>
+        </div>
+
         <footer class="footer" id="contacts">
             <div class="footer-main">
                 <div class="footer-info">

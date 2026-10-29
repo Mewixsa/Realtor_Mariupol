@@ -14,7 +14,8 @@
 }
 
 html {
-    scroll-behavior: smooth
+    scroll-behavior: smooth;
+    background-color: #24221f
 }
 
 body {
@@ -527,6 +528,88 @@ a {
     color: #386b4b
 }
 
+.property-card {
+    cursor: pointer
+}
+
+.property-card:focus-visible {
+    outline: 2px solid #9d8667;
+    outline-offset: 4px
+}
+
+body.modal-open {
+    overflow: hidden
+}
+
+.success-modal[hidden] {
+    display: none
+}
+
+.success-modal {
+    position: fixed;
+    z-index: 20;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    padding: 22px
+}
+
+.success-modal__backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(24, 22, 20, .72);
+    backdrop-filter: blur(5px)
+}
+
+.success-modal__panel {
+    position: relative;
+    width: min(100%, 440px);
+    padding: 44px 34px 34px;
+    background: #f5f0e8;
+    color: #36312d;
+    text-align: center;
+    box-shadow: 0 24px 80px rgba(0, 0, 0, .28)
+}
+
+.success-modal__close {
+    position: absolute;
+    top: 10px;
+    right: 14px;
+    border: 0;
+    background: transparent;
+    color: #625a50;
+    cursor: pointer;
+    font: 28px/1 var(--sans)
+}
+
+.success-modal__mark {
+    display: grid;
+    width: 48px;
+    height: 48px;
+    place-items: center;
+    margin: 0 auto 20px;
+    border: 1px solid #b7a184;
+    border-radius: 50%;
+    color: #806c50;
+    font-size: 22px
+}
+
+.success-modal__panel .eyebrow {
+    margin-bottom: 12px
+}
+
+.success-modal__panel h2 {
+    margin: 0;
+    font: 400 clamp(27px, 7vw, 36px)/1.2 var(--serif)
+}
+
+.success-modal__panel p {
+    margin: 14px auto 22px;
+    color: #777068;
+    font-size: 13px;
+    line-height: 1.7
+}
+
 .cases-state {
     min-height: 210px;
     display: flex;
@@ -890,7 +973,7 @@ a {
 }
 
 .footer {
-    padding: 42px clamp(24px, 7.2vw, 112px) 20px;
+    padding: 42px clamp(24px, 7.2vw, 112px) max(20px, env(safe-area-inset-bottom));
     background: #24221f;
     color: #d2cbc1;
     font-size: 11px
@@ -1258,7 +1341,7 @@ a {
     }
 
     .footer {
-        padding: 34px 22px 18px
+        padding: 34px 22px max(18px, env(safe-area-inset-bottom))
     }
 
     .footer-main {
