@@ -5,6 +5,8 @@ import mimetypes
 import os
 import sqlite3
 from urllib.parse import urlparse
+
+import psycopg
 from aiohttp import web
 import aiohttp_cors
 from aiogram import Bot, Dispatcher, types, F
@@ -20,30 +22,126 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "5270819992"))
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Render persistent disk is mounted at /var/data; local development keeps the DB beside this file.
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+if os.environ.get("RENDER") and not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is required on Render; refusing to start with an empty SQLite catalog.")
+# SQLite remains available for local development when DATABASE_URL is not configured.
 DATA_DIR = os.environ.get("DATA_DIR", "/var/data" if os.path.isdir("/var/data") else os.path.dirname(os.path.abspath(__file__)))
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "leads.db")
-LEGACY_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.db")
+LEGACY_DB_PATHS = list(dict.fromkeys([
+    os.path.join(DATA_DIR, "leads.db"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.db"),
+]))
 
 
-def migrate_legacy_database():
-    """Copy the existing working-directory SQLite database onto the persistent disk once."""
-    if os.path.exists(DB_PATH) or not os.path.isfile(LEGACY_DB_PATH):
+class DatabaseCursor:
+    """Small compatibility layer: existing SQLite-style SQL also works on PostgreSQL."""
+    def __init__(self, cursor, postgres):
+        self._cursor = cursor
+        self._postgres = postgres
+        self._lastrowid = None
+
+    def execute(self, query, params=()):
+        self._lastrowid = None
+        if self._postgres:
+            query = query.replace("?", "%s")
+            if query.lstrip().upper().startswith("INSERT INTO") and " RETURNING " not in query.upper():
+                query = query.rstrip().rstrip(";") + " RETURNING id"
+                self._cursor.execute(query, params)
+                row = self._cursor.fetchone()
+                self._lastrowid = row[0] if row else None
+            else:
+                self._cursor.execute(query, params)
+        else:
+            self._cursor.execute(query, params)
+        return self
+
+    @property
+    def lastrowid(self):
+        return self._lastrowid if self._postgres else self._cursor.lastrowid
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+
+class DatabaseConnection:
+    def __init__(self):
+        self.postgres = bool(DATABASE_URL)
+        self.connection = psycopg.connect(DATABASE_URL) if self.postgres else sqlite3.connect(DB_PATH)
+
+    def cursor(self):
+        return DatabaseCursor(self.connection.cursor(), self.postgres)
+
+    def commit(self):
+        self.connection.commit()
+
+    def close(self):
+        self.connection.close()
+
+
+def connect_db():
+    return DatabaseConnection()
+
+
+def migrate_legacy_sqlite_to_postgres():
+    """Import the persistent-disk SQLite database into Neon once, if available."""
+    if not DATABASE_URL:
         return
-    if os.path.abspath(DB_PATH) == os.path.abspath(LEGACY_DB_PATH):
+
+    legacy_db_path = next((path for path in LEGACY_DB_PATHS if os.path.isfile(path)), None)
+    if not legacy_db_path:
         return
 
-    source = sqlite3.connect(LEGACY_DB_PATH)
-    destination = sqlite3.connect(DB_PATH)
+    sqlite_conn = sqlite3.connect(legacy_db_path)
+    sqlite_conn.row_factory = None
+    pg_conn = psycopg.connect(DATABASE_URL)
     try:
-        source.backup(destination)
+        pg_cur = pg_conn.cursor()
+        pg_cur.execute("CREATE TABLE IF NOT EXISTS app_migrations (name TEXT PRIMARY KEY)")
+        pg_cur.execute("SELECT 1 FROM app_migrations WHERE name = %s", ("sqlite_to_postgres_v1",))
+        if pg_cur.fetchone():
+            print("SQLite-to-PostgreSQL import already completed.")
+            return
+
+        pg_cur.execute("SELECT (SELECT COUNT(*) FROM leads) + (SELECT COUNT(*) FROM properties) + (SELECT COUNT(*) FROM cases)")
+        if pg_cur.fetchone()[0] != 0:
+            print("Skipping SQLite import: PostgreSQL already contains records; SQLite is left untouched.")
+            return
+
+        tables = {
+            "leads": "id, name, phone, telegram, goal, contact, status",
+            "properties": "id, title, price, address, area, floor, deadline, photo_url, photo_file_id",
+            "cases": "id, title, location, goal, photo_url, photo_file_id, story, result, status, created_at",
+        }
+        for table, columns in tables.items():
+            try:
+                rows = sqlite_conn.execute(f"SELECT {columns} FROM {table}").fetchall()
+            except sqlite3.OperationalError:
+                continue
+            placeholders = ", ".join(["%s"] * len(columns.split(",")))
+            pg_cur.executemany(
+                f"INSERT INTO {table} ({columns}) VALUES ({placeholders}) ON CONFLICT (id) DO NOTHING",
+                rows,
+            )
+            pg_cur.execute(
+                "SELECT setval(pg_get_serial_sequence(%s, 'id'), COALESCE(MAX(id), 1), MAX(id) IS NOT NULL) FROM " + table,
+                (table,),
+            )
+
+        pg_cur.execute("INSERT INTO app_migrations (name) VALUES (%s) ON CONFLICT DO NOTHING", ("sqlite_to_postgres_v1",))
+        pg_conn.commit()
+        print("Imported legacy SQLite records into PostgreSQL.")
     finally:
-        destination.close()
-        source.close()
-
-
-migrate_legacy_database()
+        sqlite_conn.close()
+        pg_conn.close()
 
 
 class AddProperty(StatesGroup):
@@ -69,50 +167,65 @@ class ReplacePhoto(StatesGroup):
     photo = State()
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS leads (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT, phone TEXT, telegram TEXT, goal TEXT, contact TEXT, status TEXT DEFAULT 'new'
-        )
-    ''')
-    # Обновленная таблица с подробными характеристиками
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS properties (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            price TEXT,
-            address TEXT,
-            area TEXT,
-            floor TEXT,
-            deadline TEXT,
-            photo_url TEXT,
-            photo_file_id TEXT
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS cases (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            location TEXT NOT NULL,
-            goal TEXT NOT NULL,
-            photo_url TEXT,
-            photo_file_id TEXT,
-            story TEXT NOT NULL,
-            result TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'draft',
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    for table in ('properties', 'cases'):
-        columns = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
-        if 'photo_file_id' not in columns:
-            cursor.execute(f"ALTER TABLE {table} ADD COLUMN photo_file_id TEXT")
+    if DATABASE_URL:
+        statements = [
+            """CREATE TABLE IF NOT EXISTS leads (
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                name TEXT, phone TEXT, telegram TEXT, goal TEXT, contact TEXT,
+                status TEXT DEFAULT 'new'
+            )""",
+            """CREATE TABLE IF NOT EXISTS properties (
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                title TEXT, price TEXT, address TEXT, area TEXT, floor TEXT,
+                deadline TEXT, photo_url TEXT, photo_file_id TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS cases (
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                title TEXT NOT NULL, location TEXT NOT NULL, goal TEXT NOT NULL,
+                photo_url TEXT, photo_file_id TEXT, story TEXT NOT NULL,
+                result TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""",
+            "ALTER TABLE properties ADD COLUMN IF NOT EXISTS photo_file_id TEXT",
+            "ALTER TABLE cases ADD COLUMN IF NOT EXISTS photo_file_id TEXT",
+        ]
+        for statement in statements:
+            cursor.execute(statement)
+    else:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS leads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT, phone TEXT, telegram TEXT, goal TEXT, contact TEXT, status TEXT DEFAULT 'new'
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS properties (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT, price TEXT, address TEXT, area TEXT, floor TEXT,
+                deadline TEXT, photo_url TEXT, photo_file_id TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL, location TEXT NOT NULL, goal TEXT NOT NULL,
+                photo_url TEXT, photo_file_id TEXT, story TEXT NOT NULL,
+                result TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        for table in ('properties', 'cases'):
+            columns = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
+            if 'photo_file_id' not in columns:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN photo_file_id TEXT")
     conn.commit()
     conn.close()
 
+
 init_db()
+migrate_legacy_sqlite_to_postgres()
 
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
@@ -136,7 +249,7 @@ async def show_leads(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, phone, telegram, goal, contact FROM leads WHERE status='new'")
     leads = cursor.fetchall()
@@ -164,7 +277,7 @@ async def show_leads(message: types.Message):
 @dp.callback_query(F.data.startswith('done_'))
 async def process_done(callback: types.CallbackQuery):
     lead_id = callback.data.split('_')[1]
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     cursor = conn.cursor()
     cursor.execute("UPDATE leads SET status='done' WHERE id=?", (lead_id,))
     conn.commit()
@@ -250,7 +363,7 @@ async def case_result(message: types.Message, state: FSMContext):
         return
     result = (message.text or "").strip()
     data = await state.get_data()
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO cases (title, location, goal, photo_url, photo_file_id, story, result, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'published')",
@@ -268,7 +381,7 @@ async def list_cases(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Нет доступа", show_alert=True)
         return
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     cursor = conn.cursor()
     cursor.execute("SELECT id, title, location, status FROM cases ORDER BY id DESC")
     cases = cursor.fetchall()
@@ -307,7 +420,7 @@ async def delete_case(callback: types.CallbackQuery):
         await callback.answer("Нет доступа", show_alert=True)
         return
     case_id = callback.data.rsplit("_", 1)[-1]
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM cases WHERE id = ?", (case_id,))
     deleted = cursor.rowcount
@@ -329,7 +442,7 @@ async def show_properties_menu(message: types.Message):
 
 @dp.callback_query(F.data == "list_properties")
 async def list_properties(callback: types.CallbackQuery):
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     cursor = conn.cursor()
     cursor.execute("SELECT id, title, price FROM properties")
     props = cursor.fetchall()
@@ -363,7 +476,7 @@ async def start_replace_property_photo(callback: types.CallbackQuery, state: FSM
 @dp.callback_query(F.data.startswith("del_prop_"))
 async def delete_property(callback: types.CallbackQuery):
     prop_id = callback.data.split("_")[2]
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM properties WHERE id=?", (prop_id,))
     conn.commit()
@@ -433,7 +546,7 @@ async def save_replacement_photo(message: types.Message, state: FSMContext):
     else:
         cursor_sql = "UPDATE properties SET photo_file_id = ?, photo_url = ? WHERE id = ?"
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     cursor = conn.cursor()
     cursor.execute(cursor_sql, (file_id, photo_url, data.get("photo_target_id")))
     updated = cursor.rowcount
@@ -458,7 +571,7 @@ async def process_photo(message: types.Message, state: FSMContext):
 
     data = await state.get_data()
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO properties (title, price, address, area, floor, deadline, photo_url, photo_file_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -478,7 +591,7 @@ async def handle_get_check(request):
 async def handle_web_lead(request):
     try:
         data = await request.json()
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_db()
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO leads (name, phone, telegram, goal, contact) VALUES (?, ?, ?, ?, ?)",
@@ -505,7 +618,7 @@ async def handle_web_lead(request):
         return web.json_response({"status": "error", "message": str(e)}, status=400)
 
 async def handle_get_properties(request):
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     cursor = conn.cursor()
     cursor.execute("SELECT id, title, price, address, area, floor, deadline, photo_url, photo_file_id FROM properties")
     rows = cursor.fetchall()
@@ -535,7 +648,7 @@ async def handle_get_properties(request):
 
 
 async def handle_get_cases(request):
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     cursor = conn.cursor()
     cursor.execute(
         "SELECT id, title, location, goal, photo_url, story, result, photo_file_id FROM cases WHERE status = 'published' ORDER BY id DESC"
@@ -610,7 +723,7 @@ async def load_telegram_photo(file_id="", legacy_url=""):
 
 async def handle_case_photo(request):
     case_id = request.match_info["case_id"]
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     cursor = conn.cursor()
     cursor.execute("SELECT photo_url, photo_file_id FROM cases WHERE id = ? AND status = 'published'", (case_id,))
     row = cursor.fetchone()
@@ -623,7 +736,7 @@ async def handle_case_photo(request):
 
 async def handle_property_photo(request):
     property_id = request.match_info["property_id"]
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     cursor = conn.cursor()
     cursor.execute("SELECT photo_url, photo_file_id FROM properties WHERE id = ?", (property_id,))
     row = cursor.fetchone()

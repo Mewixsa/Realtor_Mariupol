@@ -4,7 +4,7 @@ services:
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
-    # Persistent disk so the SQLite catalog survives deploys and restarts.
+    # Keep the previous SQLite disk available for the one-time Neon import.
     disk:
       name: realtor-bot-data
       mountPath: /var/data
@@ -14,3 +14,5 @@ services:
         value: 10000
       - key: DATA_DIR
         value: /var/data
+      - key: DATABASE_URL
+        sync: false
