@@ -1107,6 +1107,34 @@ body.modal-open {
     letter-spacing: .15em
 }
 
+.developer-credit {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 6px 10px;
+    margin-top: 20px;
+    padding-top: 16px;
+    border-top: 1px solid rgba(255,255,255,.08);
+    color: #aaa39a;
+    font-size: 10px;
+    text-align: center
+}
+
+.developer-credit a {
+    color: #d4bea0;
+    transition: color .2s
+}
+
+.developer-credit a:hover {
+    color: #f5f0e8
+}
+
+.developer-credit strong {
+    color: #f1ede6;
+    font-weight: 600
+}
+
 .menu-toggle {
     display: none
 }
