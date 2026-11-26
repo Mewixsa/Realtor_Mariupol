@@ -680,9 +680,8 @@ async def handle_get_properties(request):
         photo_url = row[7] or ""
         photo_file_id = row[8] or ""
         parsed_photo_url = urlparse(photo_url)
-        is_persistent_upload = photo_url.startswith("/api/uploads/")
-        if not is_persistent_upload and (photo_file_id or (parsed_photo_url.hostname == "api.telegram.org" and parsed_photo_url.path.startswith("/file/bot"))):
-            # Fall back to Telegram only for records that have not been copied to the Render disk.
+        if photo_file_id or photo_url.startswith("/api/uploads/") or (parsed_photo_url.hostname == "api.telegram.org" and parsed_photo_url.path.startswith("/file/bot")):
+            # The API route serves disk copies and rehydrates missing files from Telegram file_id.
             photo_url = f"/api/property-photo/{row[0]}"
 
         properties.append({
@@ -713,8 +712,7 @@ async def handle_get_cases(request):
         photo_url = row[4] or ""
         photo_file_id = row[7] or ""
         parsed_photo_url = urlparse(photo_url)
-        is_persistent_upload = photo_url.startswith("/api/uploads/")
-        if not is_persistent_upload and (photo_file_id or (parsed_photo_url.hostname == "api.telegram.org" and parsed_photo_url.path.startswith("/file/bot"))):
+        if photo_file_id or photo_url.startswith("/api/uploads/") or (parsed_photo_url.hostname == "api.telegram.org" and parsed_photo_url.path.startswith("/file/bot")):
             photo_url = f"/api/case-photo/{row[0]}"
         cases.append({
             "id": row[0],
@@ -741,8 +739,10 @@ def serve_persistent_photo(photo_url):
 
     upload_root = os.path.realpath(UPLOADS_DIR)
     image_path = os.path.realpath(os.path.join(upload_root, filename))
-    if os.path.commonpath([upload_root, image_path]) != upload_root or not os.path.isfile(image_path):
+    if os.path.commonpath([upload_root, image_path]) != upload_root:
         raise web.HTTPNotFound()
+    if not os.path.isfile(image_path):
+        return None
 
     media_type = mimetypes.guess_type(image_path)[0] or "application/octet-stream"
     if not media_type.startswith("image/"):
@@ -800,9 +800,58 @@ async def load_telegram_photo(file_id="", legacy_url=""):
         raise web.HTTPBadGateway(text="Could not download legacy Telegram photo") from error
 
 
+async def serve_or_restore_photo(photo_url, file_id):
+    response = serve_persistent_photo(photo_url)
+    if response:
+        return response
+
+    response = await load_telegram_photo(file_id=file_id, legacy_url=photo_url)
+    if not file_id or not (photo_url or "").startswith("/api/uploads/"):
+        return response
+
+    filename = os.path.basename(urlparse(photo_url).path)
+    upload_root = os.path.realpath(UPLOADS_DIR)
+    image_path = os.path.realpath(os.path.join(upload_root, filename))
+    if not filename or os.path.commonpath([upload_root, image_path]) != upload_root:
+        raise web.HTTPNotFound()
+
+    temporary = f"{image_path}.tmp"
+    with open(temporary, "wb") as image_file:
+        image_file.write(response.body)
+        image_file.flush()
+        os.fsync(image_file.fileno())
+    os.replace(temporary, image_path)
+    return web.FileResponse(
+        image_path,
+        headers={"Cache-Control": "public, max-age=31536000, immutable", "X-Content-Type-Options": "nosniff"},
+    )
+
+
 async def handle_uploaded_photo(request):
     filename = request.match_info["filename"]
-    return serve_persistent_photo(f"/api/uploads/{filename}")
+    requested_url = f"/api/uploads/{filename}"
+    response = serve_persistent_photo(requested_url)
+    if response:
+        return response
+
+    conn = connect_db()
+    cursor = conn.cursor()
+    file_id = ""
+    for table in ("properties", "cases"):
+        status_clause = " AND status = 'published'" if table == "cases" else ""
+        cursor.execute(
+            f"SELECT photo_file_id FROM {table} WHERE photo_url = ?{status_clause} ORDER BY id DESC LIMIT 1",
+            (requested_url,),
+        )
+        row = cursor.fetchone()
+        if row and row[0]:
+            file_id = row[0]
+            break
+    conn.close()
+
+    if not file_id:
+        raise web.HTTPNotFound()
+    return await serve_or_restore_photo(requested_url, file_id)
 
 
 async def handle_case_photo(request):
@@ -815,10 +864,7 @@ async def handle_case_photo(request):
     if not row or not (row[0] or row[1]):
         raise web.HTTPNotFound()
     photo_url, file_id = row
-    persistent_response = serve_persistent_photo(photo_url)
-    if persistent_response:
-        return persistent_response
-    return await load_telegram_photo(file_id=file_id, legacy_url=photo_url)
+    return await serve_or_restore_photo(photo_url, file_id)
 
 
 async def handle_property_photo(request):
@@ -833,10 +879,7 @@ async def handle_property_photo(request):
         raise web.HTTPNotFound()
 
     photo_url, file_id = row
-    persistent_response = serve_persistent_photo(photo_url)
-    if persistent_response:
-        return persistent_response
-    return await load_telegram_photo(file_id=file_id, legacy_url=photo_url)
+    return await serve_or_restore_photo(photo_url, file_id)
 
 async def main():
     app = web.Application()
