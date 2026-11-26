@@ -572,6 +572,7 @@ async def save_replacement_photo(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
 
+    data = await state.get_data()
     file_id = ""
     photo_url = ""
     if message.photo:
@@ -590,7 +591,6 @@ async def save_replacement_photo(message: types.Message, state: FSMContext):
         await message.answer("Пришлите фотографию или ссылку на изображение.")
         return
 
-    data = await state.get_data()
     table = "cases" if data.get("photo_kind") == "case" else "properties"
     if table == "cases":
         cursor_sql = "UPDATE cases SET photo_url = ?, photo_file_id = ? WHERE id = ?"
