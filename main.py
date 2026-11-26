@@ -3,7 +3,9 @@ import html
 import io
 import mimetypes
 import os
+from pathlib import Path
 import sqlite3
+import uuid
 from urllib.parse import urlparse
 
 import psycopg
@@ -29,6 +31,8 @@ if os.environ.get("RENDER") and not DATABASE_URL:
 DATA_DIR = os.environ.get("DATA_DIR", "/var/data" if os.path.isdir("/var/data") else os.path.dirname(os.path.abspath(__file__)))
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "leads.db")
+UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
 LEGACY_DB_PATHS = list(dict.fromkeys([
     os.path.join(DATA_DIR, "leads.db"),
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.db"),
@@ -165,6 +169,41 @@ class AddCase(StatesGroup):
 
 class ReplacePhoto(StatesGroup):
     photo = State()
+
+
+async def save_uploaded_photo(message: types.Message, prefix: str):
+    """Copy a Telegram photo to Render's persistent disk and return its public API path."""
+    if not message.photo:
+        return "", ""
+
+    photo = message.photo[-1]
+    telegram_file = await bot.get_file(photo.file_id)
+    if not telegram_file.file_path:
+        raise ValueError("Telegram did not provide a file path for the uploaded photo")
+
+    file_path = Path(telegram_file.file_path)
+    suffix = file_path.suffix.lower()
+    allowed_suffixes = {".jpg", ".jpeg", ".png", ".webp"}
+    if suffix not in allowed_suffixes:
+        suffix = ".jpg"
+
+    image_buffer = io.BytesIO()
+    await bot.download_file(telegram_file.file_path, destination=image_buffer)
+    image_data = image_buffer.getvalue()
+    if not image_data:
+        raise ValueError("Telegram returned an empty image")
+
+    filename = f"{prefix}_{uuid.uuid4().hex}{suffix}"
+    destination = os.path.join(UPLOADS_DIR, filename)
+    temporary = f"{destination}.tmp"
+    with open(temporary, "wb") as image_file:
+        image_file.write(image_data)
+        image_file.flush()
+        os.fsync(image_file.fileno())
+    os.replace(temporary, destination)
+
+    return f"/api/uploads/{filename}", photo.file_id
+
 
 def init_db():
     conn = connect_db()
@@ -340,7 +379,7 @@ async def case_photo(message: types.Message, state: FSMContext):
     photo_url = ""
     photo_file_id = ""
     if message.photo:
-        photo_file_id = message.photo[-1].file_id
+        photo_url, photo_file_id = await save_uploaded_photo(message, "case")
     elif message.text and message.text.strip().lower() != "пропустить":
         photo_url = message.text.strip()
     await state.update_data(photo_url=photo_url, photo_file_id=photo_file_id)
@@ -533,8 +572,20 @@ async def save_replacement_photo(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
 
-    file_id = message.photo[-1].file_id if message.photo else ""
-    photo_url = message.text.strip() if message.text else ""
+    file_id = ""
+    photo_url = ""
+    if message.photo:
+        try:
+            photo_url, file_id = await save_uploaded_photo(
+                message,
+                f"{data.get('photo_kind', 'property')}_{data.get('photo_target_id', 'item')}",
+            )
+        except Exception as error:
+            print(f"Failed to save replacement photo: {error}")
+            await message.answer("Не удалось сохранить фото. Попробуйте отправить его ещё раз.")
+            return
+    elif message.text:
+        photo_url = message.text.strip()
     if not file_id and not photo_url:
         await message.answer("Пришлите фотографию или ссылку на изображение.")
         return
@@ -542,13 +593,13 @@ async def save_replacement_photo(message: types.Message, state: FSMContext):
     data = await state.get_data()
     table = "cases" if data.get("photo_kind") == "case" else "properties"
     if table == "cases":
-        cursor_sql = "UPDATE cases SET photo_file_id = ?, photo_url = ? WHERE id = ?"
+        cursor_sql = "UPDATE cases SET photo_url = ?, photo_file_id = ? WHERE id = ?"
     else:
-        cursor_sql = "UPDATE properties SET photo_file_id = ?, photo_url = ? WHERE id = ?"
+        cursor_sql = "UPDATE properties SET photo_url = ?, photo_file_id = ? WHERE id = ?"
 
     conn = connect_db()
     cursor = conn.cursor()
-    cursor.execute(cursor_sql, (file_id, photo_url, data.get("photo_target_id")))
+    cursor.execute(cursor_sql, (photo_url, file_id, data.get("photo_target_id")))
     updated = cursor.rowcount
     conn.commit()
     conn.close()
@@ -565,7 +616,7 @@ async def process_photo(message: types.Message, state: FSMContext):
     photo_url = ""
     photo_file_id = ""
     if message.photo:
-        photo_file_id = message.photo[-1].file_id
+        photo_url, photo_file_id = await save_uploaded_photo(message, "property")
     elif message.text:
         photo_url = message.text.strip()
 
@@ -675,8 +726,34 @@ async def handle_get_cases(request):
     return web.json_response(cases)
 
 
+def serve_persistent_photo(photo_url):
+    """Serve an image stored under the persistent uploads directory only."""
+    parsed_url = urlparse(photo_url or "")
+    prefix = "/api/uploads/"
+    if parsed_url.scheme or parsed_url.netloc or not parsed_url.path.startswith(prefix):
+        return None
+
+    filename = os.path.basename(parsed_url.path[len(prefix):])
+    if not filename or filename != parsed_url.path[len(prefix):]:
+        raise web.HTTPNotFound()
+
+    upload_root = os.path.realpath(UPLOADS_DIR)
+    image_path = os.path.realpath(os.path.join(upload_root, filename))
+    if os.path.commonpath([upload_root, image_path]) != upload_root or not os.path.isfile(image_path):
+        raise web.HTTPNotFound()
+
+    media_type = mimetypes.guess_type(image_path)[0] or "application/octet-stream"
+    if not media_type.startswith("image/"):
+        raise web.HTTPNotFound()
+
+    return web.FileResponse(
+        image_path,
+        headers={"Cache-Control": "public, max-age=31536000, immutable", "X-Content-Type-Options": "nosniff"},
+    )
+
+
 async def load_telegram_photo(file_id="", legacy_url=""):
-    """Load a Telegram photo using the bot's configured Telegram session."""
+    """Fallback for legacy records saved before photo files were copied to the Render disk."""
     try:
         if file_id:
             telegram_file = await bot.get_file(file_id)
@@ -718,7 +795,12 @@ async def load_telegram_photo(file_id="", legacy_url=""):
     except web.HTTPException:
         raise
     except Exception as error:
-        raise web.HTTPBadGateway(text="Could not download photo from Telegram") from error
+        raise web.HTTPBadGateway(text="Could not download legacy Telegram photo") from error
+
+
+async def handle_uploaded_photo(request):
+    filename = request.match_info["filename"]
+    return serve_persistent_photo(f"/api/uploads/{filename}")
 
 
 async def handle_case_photo(request):
@@ -731,6 +813,9 @@ async def handle_case_photo(request):
     if not row or not (row[0] or row[1]):
         raise web.HTTPNotFound()
     photo_url, file_id = row
+    persistent_response = serve_persistent_photo(photo_url)
+    if persistent_response:
+        return persistent_response
     return await load_telegram_photo(file_id=file_id, legacy_url=photo_url)
 
 
@@ -746,6 +831,9 @@ async def handle_property_photo(request):
         raise web.HTTPNotFound()
 
     photo_url, file_id = row
+    persistent_response = serve_persistent_photo(photo_url)
+    if persistent_response:
+        return persistent_response
     return await load_telegram_photo(file_id=file_id, legacy_url=photo_url)
 
 async def main():
@@ -756,6 +844,7 @@ async def main():
     app.router.add_post('/api/lead', handle_web_lead)
     app.router.add_get('/api/properties', handle_get_properties)
     app.router.add_get('/api/property-photo/{property_id}', handle_property_photo)
+    app.router.add_get('/api/uploads/{filename}', handle_uploaded_photo)
     app.router.add_get('/api/cases', handle_get_cases)
     app.router.add_get('/api/case-photo/{case_id}', handle_case_photo)
 
