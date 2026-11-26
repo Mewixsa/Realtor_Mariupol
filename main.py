@@ -680,8 +680,9 @@ async def handle_get_properties(request):
         photo_url = row[7] or ""
         photo_file_id = row[8] or ""
         parsed_photo_url = urlparse(photo_url)
-        if photo_file_id or (parsed_photo_url.hostname == "api.telegram.org" and parsed_photo_url.path.startswith("/file/bot")):
-            # Ask Telegram for a fresh download URL; file URLs are temporary.
+        is_persistent_upload = photo_url.startswith("/api/uploads/")
+        if not is_persistent_upload and (photo_file_id or (parsed_photo_url.hostname == "api.telegram.org" and parsed_photo_url.path.startswith("/file/bot"))):
+            # Fall back to Telegram only for records that have not been copied to the Render disk.
             photo_url = f"/api/property-photo/{row[0]}"
 
         properties.append({
@@ -712,7 +713,8 @@ async def handle_get_cases(request):
         photo_url = row[4] or ""
         photo_file_id = row[7] or ""
         parsed_photo_url = urlparse(photo_url)
-        if photo_file_id or (parsed_photo_url.hostname == "api.telegram.org" and parsed_photo_url.path.startswith("/file/bot")):
+        is_persistent_upload = photo_url.startswith("/api/uploads/")
+        if not is_persistent_upload and (photo_file_id or (parsed_photo_url.hostname == "api.telegram.org" and parsed_photo_url.path.startswith("/file/bot"))):
             photo_url = f"/api/case-photo/{row[0]}"
         cases.append({
             "id": row[0],
